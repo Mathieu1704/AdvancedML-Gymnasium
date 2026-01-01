@@ -1,0 +1,18 @@
+# RL artifacts (TensorBoard logs, checkpoints, videos)
+runs/
+videos/
+
+# Python / venv / caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+
+*.ps1
+*.txt
