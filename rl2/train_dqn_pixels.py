@@ -20,9 +20,51 @@ def linear_schedule(start: float, end: float, duration: int, t: int) -> float:
     return start + (end - start) * (t / duration)
 
 
+def _tiles_visited(env) -> float:
+    """
+    Métrique "progress" CarRacing indépendante du reward shaping.
+    - priorité: env.unwrapped.tile_visited_count
+    - fallback: compter env.unwrapped.road[i].visited
+    - sinon: NaN
+    """
+    uw = env.unwrapped
+
+    if hasattr(uw, "tile_visited_count"):
+        try:
+            return float(getattr(uw, "tile_visited_count"))
+        except Exception:
+            pass
+
+    if hasattr(uw, "road"):
+        try:
+            road = getattr(uw, "road")
+            if isinstance(road, (list, tuple)) and len(road) > 0:
+                cnt = 0
+                for t in road:
+                    if hasattr(t, "visited") and bool(getattr(t, "visited")):
+                        cnt += 1
+                return float(cnt)
+        except Exception:
+            pass
+
+    return float("nan")
+
+
 @torch.no_grad()
-def evaluate_pixels(env_id: str, qnet: CNNQNetwork, device: torch.device, episodes: int, seed: int,
-                   cfg: PixelPipelineConfig, env_kwargs: dict) -> float:
+def evaluate_pixels(
+    env_id: str,
+    qnet: CNNQNetwork,
+    device: torch.device,
+    episodes: int,
+    seed: int,
+    cfg: PixelPipelineConfig,
+    env_kwargs: dict,
+    shaping_kwargs: dict,
+) -> tuple[float, float]:
+    """
+    Retourne (mean_return, mean_tiles_visited).
+    tiles_visited est (quasi) invariant aux reward shapings => bonne métrique inter-runs.
+    """
     env = make_pixels_only_env(
         env_id=env_id,
         seed=seed,
@@ -30,9 +72,12 @@ def evaluate_pixels(env_id: str, qnet: CNNQNetwork, device: torch.device, episod
         env_kwargs=env_kwargs,
         record_episode_stats=True,
         record_video=False,
+        **shaping_kwargs,
     )
 
-    returns = []
+    returns: list[float] = []
+    tiles: list[float] = []
+
     for ep in range(episodes):
         obs, info = env.reset(seed=seed + ep)
         done = False
@@ -45,18 +90,29 @@ def evaluate_pixels(env_id: str, qnet: CNNQNetwork, device: torch.device, episod
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
-        returns.append(float(info["episode"]["r"]) if "episode" in info else np.nan)
+        # return (shaped ou non, mais utile)
+        if "episode" in info:
+            returns.append(float(info["episode"]["r"]))
+        else:
+            returns.append(float("nan"))
+
+        tiles.append(_tiles_visited(env))
 
     env.close()
-    returns = [r for r in returns if np.isfinite(r)]
-    return float(np.mean(returns)) if returns else float("nan")
+
+    returns_f = [r for r in returns if np.isfinite(r)]
+    tiles_f = [t for t in tiles if np.isfinite(t)]
+
+    mean_return = float(np.mean(returns_f)) if returns_f else float("nan")
+    mean_tiles = float(np.mean(tiles_f)) if tiles_f else float("nan")
+    return mean_return, mean_tiles
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
 
     p.add_argument("--env-id", type=str, default="CartPole-v1")
-    p.add_argument("--env-kwargs", type=str, default="{}", help="JSON dict passed to gym.make (e.g. CarRacing: {\"continuous\": false})")
+    p.add_argument("--env-kwargs", type=str, default="{}", help='JSON dict passed to gym.make (e.g. CarRacing: {"continuous": false})')
     p.add_argument("--total-steps", type=int, default=200_000)
     p.add_argument("--seed", type=int, default=0)
 
@@ -78,11 +134,10 @@ def main() -> None:
     p.add_argument("--eps-end", type=float, default=0.05)
     p.add_argument("--eps-decay-steps", type=int, default=50_000)
 
-    # IMPORTANT: pour éviter de "perdre du temps", tu peux mettre eval_every = total_steps
-    p.add_argument("--eval-every", type=int, default=200_000)
+    # Evaluation périodique pour métriques inter-runs
+    p.add_argument("--eval-every", type=int, default=50_000)
     p.add_argument("--eval-episodes", type=int, default=5)
 
-    # NEW: checkpoints indépendants de l'évaluation
     p.add_argument("--save-every", type=int, default=50_000)
 
     p.add_argument("--run-dir", type=str, default="runs")
@@ -92,6 +147,13 @@ def main() -> None:
     p.add_argument("--double-dqn", action="store_true", default=True)
     p.add_argument("--no-double-dqn", action="store_false", dest="double_dqn")
 
+    # -------- Reward shaping args (on garde seulement le "no demi-tour") --------
+    p.add_argument("--wrong-way-penalty", type=float, default=0.0)
+    p.add_argument("--wrong-way-angle-deg", type=float, default=150.0)
+    p.add_argument("--wrong-way-speed-min", type=float, default=8.0)
+    p.add_argument("--wrong-way-confirm-steps", type=int, default=8)
+    p.add_argument("--wrong-way-backward-idx-tol", type=int, default=5)
+
     args = p.parse_args()
 
     try:
@@ -99,7 +161,7 @@ def main() -> None:
         if not isinstance(env_kwargs, dict):
             raise ValueError
     except Exception:
-        raise ValueError("--env-kwargs doit être un JSON dict, ex: '{\"continuous\": false}'")
+        raise ValueError('--env-kwargs doit être un JSON dict, ex: \'{"continuous": false}\'')
 
     cfg = PixelPipelineConfig(size=args.obs_size, frame_stack=args.frame_stack)
 
@@ -110,8 +172,25 @@ def main() -> None:
     run_name = args.run_name or f"dqn_pixels_{args.env_id}_seed{args.seed}"
     run_dir = make_run_dir(args.run_dir, run_name)
 
+    shaping_kwargs = dict(
+        wrong_way_penalty=float(args.wrong_way_penalty),
+        wrong_way_angle_deg=float(args.wrong_way_angle_deg),
+        wrong_way_speed_min=float(args.wrong_way_speed_min),
+        wrong_way_confirm_steps=int(args.wrong_way_confirm_steps),
+        wrong_way_backward_idx_tol=int(args.wrong_way_backward_idx_tol),
+
+        # on force tout le reste à 0/off (même si wrappers.py les supporte)
+        highspeed_steer_penalty_scale=0.0,
+        highspeed_steer_speed_threshold=18.0,
+        steer_oscillation_penalty=0.0,
+        center_bonus_scale=0.0,
+        center_bonus_sigma=6.0,
+        center_speed_min=10.0,
+        center_min_align=0.3,
+    )
+
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump({**vars(args), "env_kwargs_parsed": env_kwargs}, f, indent=2)
+        json.dump({**vars(args), "env_kwargs_parsed": env_kwargs, "shaping_kwargs": shaping_kwargs}, f, indent=2)
 
     writer = SafeSummaryWriter(run_dir, enabled=not args.no_tensorboard)
 
@@ -122,6 +201,7 @@ def main() -> None:
         env_kwargs=env_kwargs,
         record_episode_stats=True,
         record_video=False,
+        **shaping_kwargs,
     )
 
     obs, info = env.reset(seed=args.seed)
@@ -155,18 +235,11 @@ def main() -> None:
         next_obs, reward, terminated, truncated, info = env.step(action)
 
         done_for_reset = bool(terminated or truncated)
-        terminated_flag = bool(terminated)  # IMPORTANT: truncated bootstrappe
+        terminated_flag = bool(terminated)
 
         next_obs_u8 = obs_to_numpy_u8(next_obs)
 
-        rb.add(
-            obs_u8,
-            action,
-            float(reward),
-            next_obs_u8,
-            terminated_flag,
-        )
-
+        rb.add(obs_u8, action, float(reward), next_obs_u8, terminated_flag)
         obs = next_obs
 
         if done_for_reset and "episode" in info:
@@ -175,7 +248,6 @@ def main() -> None:
             writer.add_scalar("train/epsilon", eps, global_step)
             obs, info = env.reset()
 
-        # Learn
         if global_step >= args.learning_starts and (global_step % args.train_freq == 0) and len(rb) >= args.batch_size:
             batch = rb.sample(args.batch_size, rng)
 
@@ -205,14 +277,12 @@ def main() -> None:
 
             writer.add_scalar("train/loss", float(loss.item()), global_step)
 
-        # Target update
         if global_step % args.target_update_freq == 0 and global_step > 0:
             if args.tau >= 1.0:
                 target.load_state_dict(qnet.state_dict())
             else:
                 soft_update_(target, qnet, tau=args.tau)
 
-        # Save checkpoint (indépendant de l'éval)
         if (global_step + 1) % args.save_every == 0:
             ckpt_path = os.path.join(run_dir, "checkpoints", f"step_{global_step+1}.pt")
             torch.save(
@@ -227,15 +297,22 @@ def main() -> None:
                 ckpt_path,
             )
 
-        # Eval (rare) + log
+        # ---- Eval périodique : log return + tiles visited ----
         if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
-            eval_return = evaluate_pixels(
-                args.env_id, qnet, device, args.eval_episodes, seed=args.seed + 12345, cfg=cfg, env_kwargs=env_kwargs
+            mean_return, mean_tiles = evaluate_pixels(
+                args.env_id,
+                qnet,
+                device,
+                args.eval_episodes,
+                seed=args.seed + 12345,
+                cfg=cfg,
+                env_kwargs=env_kwargs,
+                shaping_kwargs=shaping_kwargs,
             )
-            writer.add_scalar("eval/mean_return", eval_return, global_step + 1)
-            progress.set_postfix({"eps": f"{eps:.3f}", "eval": f"{eval_return:.1f}"})
+            writer.add_scalar("eval/mean_return", mean_return, global_step + 1)
+            writer.add_scalar("eval/mean_tiles_visited", mean_tiles, global_step + 1)
+            progress.set_postfix({"eps": f"{eps:.3f}", "evalR": f"{mean_return:.1f}", "tiles": f"{mean_tiles:.1f}"})
 
-    # Save final (au cas où total_steps n'est pas multiple de save_every)
     final_path = os.path.join(run_dir, "checkpoints", f"step_{args.total_steps}.pt")
     torch.save(
         {
