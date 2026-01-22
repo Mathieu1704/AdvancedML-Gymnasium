@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import trange
+import ale_py
+import gymnasium as gym
 
 from rl2.utils import set_global_seeds, make_run_dir, SafeSummaryWriter
 from rl2.replay_buffer import ReplayBuffer
@@ -23,9 +25,7 @@ def linear_schedule(start: float, end: float, duration: int, t: int) -> float:
 def _tiles_visited(env) -> float:
     """
     Métrique "progress" CarRacing indépendante du reward shaping.
-    - priorité: env.unwrapped.tile_visited_count
-    - fallback: compter env.unwrapped.road[i].visited
-    - sinon: NaN
+    Renvoie NaN pour Pong/LunarLander.
     """
     uw = env.unwrapped
 
@@ -60,10 +60,10 @@ def evaluate_pixels(
     cfg: PixelPipelineConfig,
     env_kwargs: dict,
     shaping_kwargs: dict,
+    skip_frames: int
 ) -> tuple[float, float]:
     """
     Retourne (mean_return, mean_tiles_visited).
-    tiles_visited est (quasi) invariant aux reward shapings => bonne métrique inter-runs.
     """
     env = make_pixels_only_env(
         env_id=env_id,
@@ -72,6 +72,7 @@ def evaluate_pixels(
         env_kwargs=env_kwargs,
         record_episode_stats=True,
         record_video=False,
+        skip_frames=skip_frames,  # <-- Ajouté ici
         **shaping_kwargs,
     )
 
@@ -90,7 +91,6 @@ def evaluate_pixels(
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
-        # return (shaped ou non, mais utile)
         if "episode" in info:
             returns.append(float(info["episode"]["r"]))
         else:
@@ -109,6 +109,7 @@ def evaluate_pixels(
 
 
 def main() -> None:
+    gym.register_envs(ale_py)
     p = argparse.ArgumentParser()
 
     p.add_argument("--env-id", type=str, default="CartPole-v1")
@@ -118,6 +119,8 @@ def main() -> None:
 
     p.add_argument("--obs-size", type=int, default=84)
     p.add_argument("--frame-stack", type=int, default=4)
+    # --- MERGE: Paramètre Skip Frames (défaut 4 pour Pong/CarRacing standard) ---
+    p.add_argument("--skip-frames", type=int, default=4, help="Frames to skip (0 = disable)")
 
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -134,7 +137,6 @@ def main() -> None:
     p.add_argument("--eps-end", type=float, default=0.05)
     p.add_argument("--eps-decay-steps", type=int, default=50_000)
 
-    # Evaluation périodique pour métriques inter-runs
     p.add_argument("--eval-every", type=int, default=50_000)
     p.add_argument("--eval-episodes", type=int, default=5)
 
@@ -147,12 +149,16 @@ def main() -> None:
     p.add_argument("--double-dqn", action="store_true", default=True)
     p.add_argument("--no-double-dqn", action="store_false", dest="double_dqn")
 
-    # -------- Reward shaping args (on garde seulement le "no demi-tour") --------
+    # -------- Reward shaping args --------
     p.add_argument("--wrong-way-penalty", type=float, default=0.0)
     p.add_argument("--wrong-way-angle-deg", type=float, default=150.0)
     p.add_argument("--wrong-way-speed-min", type=float, default=8.0)
     p.add_argument("--wrong-way-confirm-steps", type=int, default=8)
     p.add_argument("--wrong-way-backward-idx-tol", type=int, default=5)
+
+    p.add_argument("--highspeed-steer-penalty", type=float, default=0.0)
+    p.add_argument("--steer-oscillation-penalty", type=float, default=0.0)
+    p.add_argument("--center-bonus", type=float, default=0.0)
 
     args = p.parse_args()
 
@@ -162,6 +168,12 @@ def main() -> None:
             raise ValueError
     except Exception:
         raise ValueError('--env-kwargs doit être un JSON dict, ex: \'{"continuous": false}\'')
+
+
+    if "CarRacing" in args.env_id or "LunarLander" in args.env_id:
+        if "continuous" not in env_kwargs:
+            print(f"ℹ Auto-config: Passage en mode DISCRET pour {args.env_id}")
+            env_kwargs["continuous"] = False
 
     cfg = PixelPipelineConfig(size=args.obs_size, frame_stack=args.frame_stack)
 
@@ -178,12 +190,14 @@ def main() -> None:
         wrong_way_speed_min=float(args.wrong_way_speed_min),
         wrong_way_confirm_steps=int(args.wrong_way_confirm_steps),
         wrong_way_backward_idx_tol=int(args.wrong_way_backward_idx_tol),
-
-        # on force tout le reste à 0/off (même si wrappers.py les supporte)
-        highspeed_steer_penalty_scale=0.0,
+        
+        # Maintenant reliés aux arguments (par défaut 0.0)
+        highspeed_steer_penalty_scale=float(args.highspeed_steer_penalty), 
+        steer_oscillation_penalty=float(args.steer_oscillation_penalty),
+        center_bonus_scale=float(args.center_bonus),
+        
+        # Ceux-là peuvent rester en dur car moins importants à tuner
         highspeed_steer_speed_threshold=18.0,
-        steer_oscillation_penalty=0.0,
-        center_bonus_scale=0.0,
         center_bonus_sigma=6.0,
         center_speed_min=10.0,
         center_min_align=0.3,
@@ -201,6 +215,7 @@ def main() -> None:
         env_kwargs=env_kwargs,
         record_episode_stats=True,
         record_video=False,
+        skip_frames=args.skip_frames,  # <-- Passe l'argument
         **shaping_kwargs,
     )
 
@@ -297,7 +312,6 @@ def main() -> None:
                 ckpt_path,
             )
 
-        # ---- Eval périodique : log return + tiles visited ----
         if args.eval_every > 0 and (global_step + 1) % args.eval_every == 0:
             mean_return, mean_tiles = evaluate_pixels(
                 args.env_id,
@@ -308,6 +322,7 @@ def main() -> None:
                 cfg=cfg,
                 env_kwargs=env_kwargs,
                 shaping_kwargs=shaping_kwargs,
+                skip_frames=args.skip_frames, # <-- Passe l'argument
             )
             writer.add_scalar("eval/mean_return", mean_return, global_step + 1)
             writer.add_scalar("eval/mean_tiles_visited", mean_tiles, global_step + 1)

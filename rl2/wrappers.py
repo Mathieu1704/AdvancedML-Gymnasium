@@ -56,23 +56,88 @@ def _safe_xy(x: Any) -> Optional[tuple[float, float]]:
 
 
 # ----------------------------
-# 1) Pénalité contresens (déjà OK chez toi)
+# WRAPPERS CRITIQUES (Venant de ton code)
 # ----------------------------
-class WrongWayPenalty(gym.Wrapper):
-    """
-    Pénalise le contresens dans CarRacing de manière robuste:
-    - utilise direction de déplacement (vitesse) plutôt que l'angle du châssis
-    - compare à la tangente locale de la piste (alpha) via env.unwrapped.track
-    - hystérésis : contresens plusieurs steps d'affilée
-    - recul d'index sur la piste (optionnel) pour capturer les retours arrière
-    """
 
+class SkipFrame(gym.Wrapper):
+    """
+    Saute 'skip' frames à chaque step.
+    Essentiel pour Pong et LunarLanderPixels pour accélérer l'entraînement.
+    """
+    def __init__(self, env, skip=4):
+        super().__init__(env)
+        self._skip = skip
+
+    def step(self, action):
+        total_reward = 0.0
+        done = False
+        terminated = False
+        truncated = False
+        
+        for i in range(self._skip):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += float(reward)
+            done = terminated or truncated
+            if done:
+                break
+        
+        return obs, total_reward, terminated, truncated, info
+
+
+class FireAndLifeLoss(gym.Wrapper):
+    """
+    WRAPPER CRITIQUE POUR PONG/BREAKOUT :
+    1. Appuie sur FIRE au début de l'épisode.
+    2. Appuie sur FIRE automatiquement quand une vie est perdue.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        self._lives = 0
+        self._fire_action = 1  # Par défaut dans ALE, 1 = FIRE
+        
+        if hasattr(env.unwrapped, 'get_action_meanings'):
+            meanings = env.unwrapped.get_action_meanings()
+            if 'FIRE' in meanings:
+                self._fire_action = meanings.index('FIRE')
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        
+        if "lives" in info:
+            lives = info["lives"]
+            if 0 < lives < self._lives:
+                # On force un step avec FIRE pour relancer la balle immédiatement
+                obs_f, r_f, term_f, trunc_f, info_f = self.env.step(self._fire_action)
+                reward += r_f
+                terminated = terminated or term_f
+                truncated = truncated or trunc_f
+                info = info_f
+            self._lives = lives
+            
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        self._lives = 0
+        obs, info = self.env.reset(**kwargs)
+        if "lives" in info:
+            self._lives = info["lives"]
+            
+        # On force FIRE dès le reset
+        self.env.step(self._fire_action)
+        return obs, info
+
+
+# ----------------------------
+# WRAPPERS CARRACING (Venant du code de Paul)
+# ----------------------------
+
+class WrongWayPenalty(gym.Wrapper):
     def __init__(
         self,
         env: gym.Env,
         penalty: float = 1.0,
-        angle_threshold_deg: float = 150.0,  # quasi opposition (≈180°)
-        speed_min: float = 8.0,              # ignore à faible vitesse
+        angle_threshold_deg: float = 150.0,
+        speed_min: float = 8.0,
         backward_idx_tol: int = 5,
         confirm_steps: int = 8,
     ):
@@ -83,19 +148,17 @@ class WrongWayPenalty(gym.Wrapper):
         self.backward_idx_tol = int(backward_idx_tol)
         self.confirm_steps = int(confirm_steps)
 
-        self._track_xy: Optional[np.ndarray] = None   # (N,2)
-        self._track_alpha: Optional[np.ndarray] = None  # (N,)
+        self._track_xy: Optional[np.ndarray] = None
+        self._track_alpha: Optional[np.ndarray] = None
         self._n: int = 0
         self._last_idx: Optional[int] = None
         self._wrong_count: int = 0
-
         self._cos_thr = math.cos(math.radians(self.angle_threshold_deg))
 
     def _parse_track(self) -> bool:
         uw = self.env.unwrapped
         if not hasattr(uw, "track"):
             return False
-
         track = getattr(uw, "track", None)
         if not isinstance(track, (list, tuple)) or len(track) < 10:
             return False
@@ -174,7 +237,6 @@ class WrongWayPenalty(gym.Wrapper):
                 vx_u, vy_u, speed = vdir
                 if speed >= self.speed_min:
                     cx, cy = pos
-
                     dxy = self._track_xy - np.asarray([cx, cy], dtype=np.float32)
                     dist2 = (dxy[:, 0] ** 2 + dxy[:, 1] ** 2)
                     idx = int(np.argmin(dist2))
@@ -189,41 +251,28 @@ class WrongWayPenalty(gym.Wrapper):
                         backward = dd < -float(self.backward_idx_tol)
 
                     wrong_candidate = (align < self._cos_thr) or backward
-
                     if wrong_candidate:
                         self._wrong_count += 1
                     else:
                         self._wrong_count = 0
 
                     wrong_way = self._wrong_count >= self.confirm_steps
-
                     if wrong_way:
                         reward = float(reward) - self.penalty
                         info = dict(info)
                         info["wrong_way"] = True
                         info["wrong_way_penalty"] = float(self.penalty)
-                        info["wrong_way_align"] = float(align)
-                        info["wrong_way_backward"] = bool(backward)
 
                     self._last_idx = idx
 
         return obs, reward, terminated, truncated, info
 
 
-# ----------------------------
-# 2) NOUVEAU: pénalité "tourner trop vite" (virages serrés)
-# ----------------------------
 class HighSpeedSteerPenalty(gym.Wrapper):
-    """
-    En discret (5 actions), l'agent doit apprendre à freiner AVANT de tourner.
-    On pénalise légèrement le fait de (steer left/right) quand la vitesse est trop élevée.
-    => réduit fortement les sorties d'herbe sur virages > 90°.
-    """
-
     def __init__(
         self,
         env: gym.Env,
-        penalty_scale: float = 0.0,  # 0 = off
+        penalty_scale: float = 0.0,
         speed_threshold: float = 18.0,
     ):
         super().__init__(env)
@@ -245,30 +294,18 @@ class HighSpeedSteerPenalty(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-
-        # CarRacing discret: 1=right, 2=left (doc Gymnasium) :contentReference[oaicite:1]{index=1}
+        # CarRacing discret: 1=right, 2=left
         if self.penalty_scale > 0.0 and int(action) in (1, 2):
             sp = self._speed()
             if sp is not None and sp > self.speed_threshold:
-                # pénalité proportionnelle au dépassement
                 reward = float(reward) - self.penalty_scale * float(sp - self.speed_threshold)
                 info = dict(info)
                 info["highspeed_steer"] = True
                 info["highspeed_steer_penalty"] = float(self.penalty_scale * (sp - self.speed_threshold))
-                info["speed"] = float(sp)
-
         return obs, reward, terminated, truncated, info
 
 
-# ----------------------------
-# 3) NOUVEAU: pénalité d'oscillation gauche/droite (tremblements)
-# ----------------------------
 class SteerOscillationPenalty(gym.Wrapper):
-    """
-    Pénalise le flip fréquent gauche<->droite (2<->1) qui crée des tremblements.
-    Très léger, sinon ça peut empêcher les corrections fines.
-    """
-
     def __init__(self, env: gym.Env, penalty: float = 0.0):
         super().__init__(env)
         self.penalty = float(penalty)
@@ -281,40 +318,23 @@ class SteerOscillationPenalty(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-
         if self.penalty > 0.0:
             a = int(action)
             pa = self._prev_action
-            # flip strict gauche<->droite
             if pa is not None and ((pa == 1 and a == 2) or (pa == 2 and a == 1)):
                 reward = float(reward) - self.penalty
                 info = dict(info)
                 info["steer_oscillation"] = True
-                info["steer_oscillation_penalty"] = float(self.penalty)
-
-            self._prev_action = a
-
+        self._prev_action = a
         return obs, reward, terminated, truncated, info
 
 
-# ----------------------------
-# 4) Bonus centre (perpendiculaire à la piste) — optionnel, à garder très faible
-# ----------------------------
 class CenterlineBonus(gym.Wrapper):
-    """
-    Bonus (faible) si la voiture est proche de la ligne centrale, mesuré comme distance
-    à la perpendiculaire à la piste passant par la voiture (i.e. projection sur la normale locale).
-
-    Important:
-    - à mettre TRÈS FAIBLE, sinon l'agent "optimise" ce bonus au détriment des virages.
-    - on l'active seulement si alignement raisonnable (pas en drift extrême / pas en marche arrière).
-    """
-
     def __init__(
         self,
         env: gym.Env,
-        bonus_scale: float = 0.0,   # 0 = off
-        sigma: float = 6.0,         # largeur (unités monde)
+        bonus_scale: float = 0.0,
+        sigma: float = 6.0,
         speed_min: float = 10.0,
         min_align: float = 0.3,
     ):
@@ -323,7 +343,6 @@ class CenterlineBonus(gym.Wrapper):
         self.sigma = float(sigma)
         self.speed_min = float(speed_min)
         self.min_align = float(min_align)
-
         self._track_xy: Optional[np.ndarray] = None
         self._track_alpha: Optional[np.ndarray] = None
 
@@ -334,7 +353,6 @@ class CenterlineBonus(gym.Wrapper):
         track = getattr(uw, "track", None)
         if not isinstance(track, (list, tuple)) or len(track) < 10:
             return False
-
         xs, ys, alphas = [], [], []
         for item in track:
             if isinstance(item, (list, tuple)) and len(item) >= 4:
@@ -347,10 +365,8 @@ class CenterlineBonus(gym.Wrapper):
                 xs.append(x)
                 ys.append(y)
                 alphas.append(alpha)
-
         if len(xs) < 10:
             return False
-
         self._track_xy = np.stack(
             [np.asarray(xs, dtype=np.float32), np.asarray(ys, dtype=np.float32)],
             axis=1,
@@ -391,7 +407,6 @@ class CenterlineBonus(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-
         if self.bonus_scale > 0.0 and self._track_xy is not None and self._track_alpha is not None:
             pos = self._car_position()
             vdir = self._car_velocity_dir()
@@ -407,23 +422,19 @@ class CenterlineBonus(gym.Wrapper):
                     tx, ty = math.cos(alpha), math.sin(alpha)
                     align = vx_u * tx + vy_u * ty
 
-                    # on ignore les cas trop ambigus (drift extrême / presque contresens)
                     if align >= self.min_align:
-                        # normale à la piste (perpendiculaire) : n = (-sin, cos)
                         nx, ny = -ty, tx
                         lateral = float(abs((cx - float(self._track_xy[idx, 0])) * nx + (cy - float(self._track_xy[idx, 1])) * ny))
-
-                        # bonus gaussien : max au centre, décroît avec la distance latérale
                         bonus = self.bonus_scale * math.exp(-(lateral * lateral) / (2.0 * self.sigma * self.sigma))
                         reward = float(reward) + float(bonus)
-
                         info = dict(info)
                         info["center_bonus"] = float(bonus)
-                        info["center_lateral"] = float(lateral)
-                        info["center_align"] = float(align)
-
         return obs, reward, terminated, truncated, info
 
+
+# ----------------------------
+# MAKE ENV (Fusionné)
+# ----------------------------
 
 def make_pixels_only_env(
     env_id: str,
@@ -437,7 +448,9 @@ def make_pixels_only_env(
     episode_trigger: Optional[Callable[[int], bool]] = None,
     step_trigger: Optional[Callable[[int], bool]] = None,
     video_length: int = 0,
-    # reward shaping
+    # --- Arguments de fusion ---
+    skip_frames: int = 4,
+    # --- Reward shaping (CarRacing) ---
     wrong_way_penalty: float = 0.0,
     wrong_way_angle_deg: float = 150.0,
     wrong_way_speed_min: float = 8.0,
@@ -452,7 +465,7 @@ def make_pixels_only_env(
     center_min_align: float = 0.3,
 ) -> gym.Env:
     """
-    Pixels-only pipeline + wrappers optionnels.
+    Pipeline unifié pour Pong, LunarLander ET CarRacing.
     """
     if env_kwargs is None:
         env_kwargs = {}
@@ -469,7 +482,13 @@ def make_pixels_only_env(
             env = gym.make(env_id, render_mode="rgb_array", **env_kwargs)
         env = AddRenderObservation(env, render_only=True)
 
-    # --- Reward shaping (ordre important) ---
+    # --- 1. DETECTION PONG/ATARI (Pour FireAndLifeLoss) ---
+    # Si le nom contient Pong/Breakout/SpaceInvaders, on active le wrapper magique.
+    target_ids = ["Pong", "Breakout", "SpaceInvaders", "Alien"]
+    if any(x in env_id for x in target_ids):
+        env = FireAndLifeLoss(env)
+
+    # --- 2. REWARD SHAPING (Spécifique CarRacing) ---
     if wrong_way_penalty and float(wrong_way_penalty) > 0.0:
         env = WrongWayPenalty(
             env,
@@ -499,15 +518,13 @@ def make_pixels_only_env(
             min_align=float(center_min_align),
         )
 
-    # --- Video ---
+    # --- 3. VIDEO ---
     if record_video:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         actual_folder = os.path.join(video_folder, f"{video_name_prefix}_{stamp}")
         os.makedirs(actual_folder, exist_ok=True)
-
         if episode_trigger is None and step_trigger is None:
             episode_trigger = lambda ep: ep == 0
-
         env = RecordVideo(
             env,
             video_folder=actual_folder,
@@ -520,16 +537,19 @@ def make_pixels_only_env(
     if record_episode_stats:
         env = RecordEpisodeStatistics(env)
 
-    # Grayscale si RGB
+    # --- 4. SKIP FRAMES ---
+    # On applique SkipFrame ici, sauf si l'utilisateur met skip_frames=0
+    if skip_frames > 0:
+        env = SkipFrame(env, skip=skip_frames)
+
+    # --- 5. PROCESSING IMAGE ---
     obs_space = env.observation_space
     if isinstance(obs_space, gym.spaces.Box) and obs_space.shape is not None and len(obs_space.shape) == 3:
         env = GrayscaleObservation(env, keep_dim=False)
 
-    # Resize
     shape = cfg.size if isinstance(cfg.size, tuple) else (cfg.size, cfg.size)
     env = ResizeObservation(env, shape)
 
-    # Frame stack
     env = _FrameStack(env, cfg.frame_stack)
 
     env.reset(seed=seed)
