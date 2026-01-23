@@ -20,7 +20,6 @@ class CNNQNetwork(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
-            # Rend robuste si H,W diffèrent légèrement (tout en gardant une taille fixe pour FC)
             nn.AdaptiveAvgPool2d((7, 7)),
         )
         self.fc = nn.Sequential(

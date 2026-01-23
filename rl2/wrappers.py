@@ -29,7 +29,6 @@ class PixelPipelineConfig:
 
 
 def _is_image_space(space: gym.Space) -> bool:
-    """Heuristique: une observation pixels est typiquement Box uint8 en 2D ou 3D."""
     if not isinstance(space, gym.spaces.Box):
         return False
     if space.dtype != np.uint8:
@@ -44,7 +43,6 @@ def _is_image_space(space: gym.Space) -> bool:
 
 
 def _safe_xy(x: Any) -> Optional[tuple[float, float]]:
-    """Convertit Box2D vec/tuple -> (x,y) float si possible."""
     try:
         if hasattr(x, "x") and hasattr(x, "y"):
             return float(x.x), float(x.y)
@@ -55,15 +53,7 @@ def _safe_xy(x: Any) -> Optional[tuple[float, float]]:
     return None
 
 
-# ----------------------------
-# WRAPPERS CRITIQUES (Venant de ton code)
-# ----------------------------
-
 class SkipFrame(gym.Wrapper):
-    """
-    Saute 'skip' frames à chaque step.
-    Essentiel pour Pong et LunarLanderPixels pour accélérer l'entraînement.
-    """
     def __init__(self, env, skip=4):
         super().__init__(env)
         self._skip = skip
@@ -85,15 +75,10 @@ class SkipFrame(gym.Wrapper):
 
 
 class FireAndLifeLoss(gym.Wrapper):
-    """
-    WRAPPER CRITIQUE POUR PONG/BREAKOUT :
-    1. Appuie sur FIRE au début de l'épisode.
-    2. Appuie sur FIRE automatiquement quand une vie est perdue.
-    """
     def __init__(self, env):
         super().__init__(env)
         self._lives = 0
-        self._fire_action = 1  # Par défaut dans ALE, 1 = FIRE
+        self._fire_action = 1 
         
         if hasattr(env.unwrapped, 'get_action_meanings'):
             meanings = env.unwrapped.get_action_meanings()
@@ -106,7 +91,6 @@ class FireAndLifeLoss(gym.Wrapper):
         if "lives" in info:
             lives = info["lives"]
             if 0 < lives < self._lives:
-                # On force un step avec FIRE pour relancer la balle immédiatement
                 obs_f, r_f, term_f, trunc_f, info_f = self.env.step(self._fire_action)
                 reward += r_f
                 terminated = terminated or term_f
@@ -122,14 +106,9 @@ class FireAndLifeLoss(gym.Wrapper):
         if "lives" in info:
             self._lives = info["lives"]
             
-        # On force FIRE dès le reset
         self.env.step(self._fire_action)
         return obs, info
 
-
-# ----------------------------
-# WRAPPERS CARRACING (Venant du code de Paul)
-# ----------------------------
 
 class WrongWayPenalty(gym.Wrapper):
     def __init__(
@@ -432,10 +411,6 @@ class CenterlineBonus(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-# ----------------------------
-# MAKE ENV (Fusionné)
-# ----------------------------
-
 def make_pixels_only_env(
     env_id: str,
     seed: int,
@@ -448,9 +423,7 @@ def make_pixels_only_env(
     episode_trigger: Optional[Callable[[int], bool]] = None,
     step_trigger: Optional[Callable[[int], bool]] = None,
     video_length: int = 0,
-    # --- Arguments de fusion ---
     skip_frames: int = 4,
-    # --- Reward shaping (CarRacing) ---
     wrong_way_penalty: float = 0.0,
     wrong_way_angle_deg: float = 150.0,
     wrong_way_speed_min: float = 8.0,
@@ -464,9 +437,6 @@ def make_pixels_only_env(
     center_speed_min: float = 10.0,
     center_min_align: float = 0.3,
 ) -> gym.Env:
-    """
-    Pipeline unifié pour Pong, LunarLander ET CarRacing.
-    """
     if env_kwargs is None:
         env_kwargs = {}
 
@@ -481,14 +451,11 @@ def make_pixels_only_env(
             env.close()
             env = gym.make(env_id, render_mode="rgb_array", **env_kwargs)
         env = AddRenderObservation(env, render_only=True)
-
-    # --- 1. DETECTION PONG/ATARI (Pour FireAndLifeLoss) ---
-    # Si le nom contient Pong/Breakout/SpaceInvaders, on active le wrapper magique.
+    
     target_ids = ["Pong", "Breakout", "SpaceInvaders", "Alien"]
     if any(x in env_id for x in target_ids):
         env = FireAndLifeLoss(env)
 
-    # --- 2. REWARD SHAPING (Spécifique CarRacing) ---
     if wrong_way_penalty and float(wrong_way_penalty) > 0.0:
         env = WrongWayPenalty(
             env,
@@ -518,7 +485,6 @@ def make_pixels_only_env(
             min_align=float(center_min_align),
         )
 
-    # --- 3. VIDEO ---
     if record_video:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         actual_folder = os.path.join(video_folder, f"{video_name_prefix}_{stamp}")
@@ -537,12 +503,9 @@ def make_pixels_only_env(
     if record_episode_stats:
         env = RecordEpisodeStatistics(env)
 
-    # --- 4. SKIP FRAMES ---
-    # On applique SkipFrame ici, sauf si l'utilisateur met skip_frames=0
     if skip_frames > 0:
         env = SkipFrame(env, skip=skip_frames)
 
-    # --- 5. PROCESSING IMAGE ---
     obs_space = env.observation_space
     if isinstance(obs_space, gym.spaces.Box) and obs_space.shape is not None and len(obs_space.shape) == 3:
         env = GrayscaleObservation(env, keep_dim=False)

@@ -23,10 +23,6 @@ def linear_schedule(start: float, end: float, duration: int, t: int) -> float:
 
 
 def _tiles_visited(env) -> float:
-    """
-    Métrique "progress" CarRacing indépendante du reward shaping.
-    Renvoie NaN pour Pong/LunarLander.
-    """
     uw = env.unwrapped
 
     if hasattr(uw, "tile_visited_count"):
@@ -62,9 +58,6 @@ def evaluate_pixels(
     shaping_kwargs: dict,
     skip_frames: int
 ) -> tuple[float, float]:
-    """
-    Retourne (mean_return, mean_tiles_visited).
-    """
     env = make_pixels_only_env(
         env_id=env_id,
         seed=seed,
@@ -72,7 +65,7 @@ def evaluate_pixels(
         env_kwargs=env_kwargs,
         record_episode_stats=True,
         record_video=False,
-        skip_frames=skip_frames,  # <-- Ajouté ici
+        skip_frames=skip_frames, 
         **shaping_kwargs,
     )
 
@@ -149,7 +142,6 @@ def main() -> None:
     p.add_argument("--double-dqn", action="store_true", default=True)
     p.add_argument("--no-double-dqn", action="store_false", dest="double_dqn")
 
-    # -------- Reward shaping args --------
     p.add_argument("--wrong-way-penalty", type=float, default=0.0)
     p.add_argument("--wrong-way-angle-deg", type=float, default=150.0)
     p.add_argument("--wrong-way-speed-min", type=float, default=8.0)
@@ -191,12 +183,10 @@ def main() -> None:
         wrong_way_confirm_steps=int(args.wrong_way_confirm_steps),
         wrong_way_backward_idx_tol=int(args.wrong_way_backward_idx_tol),
         
-        # Maintenant reliés aux arguments (par défaut 0.0)
         highspeed_steer_penalty_scale=float(args.highspeed_steer_penalty), 
         steer_oscillation_penalty=float(args.steer_oscillation_penalty),
         center_bonus_scale=float(args.center_bonus),
         
-        # Ceux-là peuvent rester en dur car moins importants à tuner
         highspeed_steer_speed_threshold=18.0,
         center_bonus_sigma=6.0,
         center_speed_min=10.0,
@@ -215,7 +205,7 @@ def main() -> None:
         env_kwargs=env_kwargs,
         record_episode_stats=True,
         record_video=False,
-        skip_frames=args.skip_frames,  # <-- Passe l'argument
+        skip_frames=args.skip_frames, 
         **shaping_kwargs,
     )
 

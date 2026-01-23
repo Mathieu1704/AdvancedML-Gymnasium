@@ -4,15 +4,6 @@ import numpy as np
 
 
 class ReplayBuffer:
-    """
-    Replay buffer circulaire pour DQN:
-    stocke (obs, action, reward, next_obs, terminated).
-
-    IMPORTANT:
-    - terminated=True uniquement si l'état suivant est terminal "naturel" (terminated),
-      pas si truncated (time-limit), afin de bootstrapper correctement sur truncated.
-    """
-
     def __init__(self, capacity: int, obs_shape: tuple[int, ...]):
         self.capacity = int(capacity)
         self.obs_shape = obs_shape

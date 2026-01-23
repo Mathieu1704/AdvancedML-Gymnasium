@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+
 
 from rl2.dqn import CNNQNetwork
 from rl2.wrappers import make_pixels_only_env, PixelPipelineConfig, obs_to_numpy_u8
@@ -64,12 +66,6 @@ def _parse_env_kwargs(s: str) -> dict[str, Any]:
 
 
 def _tiles_visited(env) -> float:
-    """
-    Métrique "progress" CarRacing indépendante de ton reward shaping:
-    - priorité: env.unwrapped.tile_visited_count (si présent)
-    - fallback: compter env.unwrapped.road[i].visited (si présent)
-    - sinon: NaN
-    """
     uw = env.unwrapped
 
     if hasattr(uw, "tile_visited_count"):
@@ -110,8 +106,6 @@ def _save_tiles_plot(tiles: list[float], out_dir: str) -> Optional[str]:
     if tiles_arr.size == 0:
         return None
 
-    # import local pour ne pas imposer matplotlib si tu n'en veux pas
-    import matplotlib.pyplot as plt
 
     ep = np.arange(1, len(tiles_arr) + 1, dtype=np.int32)
     mean = float(np.mean(tiles_arr))
@@ -154,16 +148,12 @@ def main() -> None:
     p.add_argument("--video-folder", type=str, default="videos")
     p.add_argument("--video-prefix", type=str, default="eval")
 
-    # 0 = épisode complet ; >0 = clip fixe en steps
     p.add_argument("--video-length", type=int, default=0)
 
-    # clip unique fixe (step_trigger == 0) ; sinon on filme par épisodes
     p.add_argument("--video-once", action="store_true")
 
-    # filmer 1 épisode sur N (1=tous, 5=0,5,10...) ; ignoré si video-once
     p.add_argument("--video-every", type=int, default=1)
 
-    # NEW: sauvegarder les plots métriques (tiles) dans un dossier unique
     p.add_argument("--save-metrics", action="store_true", help="Save tiles_visited plot + metrics json")
 
     args = p.parse_args()
@@ -174,7 +164,6 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = _resolve_checkpoint_arg(args.checkpoint)
 
-    # PyTorch 2.6+ peut nécessiter weights_only=False selon contenu du .pt
     try:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     except Exception:
@@ -187,7 +176,7 @@ def main() -> None:
     qnet.load_state_dict(ckpt["model"])
     qnet.eval()
 
-    # ---- VIDEO TRIGGERS ----
+    # VIDEO
     episode_trigger = None
     step_trigger = None
     video_length = 0
@@ -230,13 +219,11 @@ def main() -> None:
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
 
-        # return (shaped ou non selon wrappers, mais utile quand même)
         if "episode" in info:
             returns.append(float(info["episode"]["r"]))
         else:
             returns.append(float("nan"))
 
-        # tiles visited (indépendant de ton reward shaping)
         tiles.append(_tiles_visited(env))
 
     env.close()
@@ -260,7 +247,7 @@ def main() -> None:
         print("Mean tiles visited: NaN (metric not available for this env)")
         print("Std  tiles visited: NaN")
 
-    # ---- SAVE METRICS + PLOT ----
+    # SAVE METRICS + PLOT
     if args.save_metrics:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         out_dir = os.path.join(args.video_folder, f"{args.video_prefix}_metrics_{stamp}")

@@ -20,11 +20,6 @@ def _is_nonempty_dir(path: str) -> bool:
 
 
 def make_run_dir(base_dir: str, run_name: str) -> str:
-    """
-    Crée un dossier de run sans écraser les anciens:
-      - si runs/<run_name> existe déjà, crée runs/<run_name>_001, _002, etc.
-      - écrit runs/LATEST.txt avec le chemin du run le plus récent
-    """
     os.makedirs(base_dir, exist_ok=True)
 
     candidate = os.path.join(base_dir, run_name)
@@ -52,11 +47,6 @@ def make_run_dir(base_dir: str, run_name: str) -> str:
 
 
 class SafeSummaryWriter:
-    """
-    Wrapper robuste pour éviter que l'entraînement crashe si Windows verrouille
-    le fichier TensorBoard (zip/antivirus/OneDrive, etc.).
-    En cas d'erreur d'écriture, on désactive les logs TB et on continue.
-    """
     def __init__(self, log_dir: str, enabled: bool = True):
         self.enabled = enabled
         self._writer: Optional[object] = None

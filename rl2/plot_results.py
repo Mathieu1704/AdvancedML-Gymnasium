@@ -8,7 +8,6 @@ from typing import Dict, List, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 
-# TensorBoard event reader (déjà présent si torch.utils.tensorboard fonctionne)
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 
@@ -19,17 +18,13 @@ class ScalarSeries:
 
 
 def _load_scalars(log_dir: str) -> Dict[str, ScalarSeries]:
-    """
-    Lit les scalars TensorBoard depuis un run_dir (celui où se trouve events.out.tfevents.*)
-    et retourne un dict {tag -> (steps, values)}.
-    """
     if not os.path.isdir(log_dir):
         raise FileNotFoundError(f"Run directory not found: {log_dir}")
 
     ea = EventAccumulator(
         log_dir,
         size_guidance={
-            "scalars": 0,   # 0 = tout charger
+            "scalars": 0,  
             "images": 0,
             "histograms": 0,
             "tensors": 0,
@@ -48,16 +43,12 @@ def _load_scalars(log_dir: str) -> Dict[str, ScalarSeries]:
 
 
 def _rolling_mean_std(x: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Rolling mean/std (min_periods=1) sur une série 1D.
-    """
     if window <= 1:
         return x.copy(), np.zeros_like(x)
 
     mean = np.empty_like(x, dtype=np.float32)
     std = np.empty_like(x, dtype=np.float32)
 
-    # implémentation simple, suffisamment rapide pour quelques dizaines de milliers de points
     for i in range(len(x)):
         j0 = max(0, i - window + 1)
         w = x[j0 : i + 1]
@@ -78,19 +69,13 @@ def plot_rewards_episode_style(
     out_dir: str,
     window: int = 100,
 ) -> None:
-    """
-    Figure type rapport :
-    - rewards par épisode (brut)
-    - moving average (window)
-    - zone +/- std (window)
-    """
     tag = "train/episode_return"
     if tag not in scalars:
         print(f"[WARN] Missing scalar: {tag} (rien à tracer)")
         return
 
     y = scalars[tag].values
-    ep = np.arange(1, len(y) + 1, dtype=np.int64)  # x = numéro d'épisode (comme dans le rapport)
+    ep = np.arange(1, len(y) + 1, dtype=np.int64)  
 
     m, s = _rolling_mean_std(y, window=window)
 
@@ -111,9 +96,6 @@ def plot_loss(
     out_dir: str,
     smooth_steps: int = 2000,
 ) -> None:
-    """
-    Loss vs global_step (avec lissage simple).
-    """
     tag = "train/loss"
     if tag not in scalars:
         print(f"[WARN] Missing scalar: {tag} (rien à tracer)")
@@ -122,8 +104,7 @@ def plot_loss(
     x = scalars[tag].steps
     y = scalars[tag].values
 
-    # lissage sur un nombre de points (pas en 'steps'), simple et robuste
-    w = max(1, int(len(y) * (smooth_steps / max(1, x[-1]))))  # approx
+    w = max(1, int(len(y) * (smooth_steps / max(1, x[-1]))))
     m, _ = _rolling_mean_std(y, window=max(1, w))
 
     plt.figure()
@@ -181,9 +162,6 @@ def plot_q_values_if_present(
     scalars: Dict[str, ScalarSeries],
     out_dir: str,
 ) -> None:
-    """
-    Pour faire comme leur figure 'Average Q-values' (si tu loggues train/q_mean etc.).
-    """
     candidates = ["train/q_mean", "train/q_max_mean", "train/q_sa_mean"]
     present = [t for t in candidates if t in scalars]
     if not present:
